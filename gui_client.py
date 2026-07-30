@@ -10,6 +10,7 @@ import socket
 from websockets import connect
 
 CONFIG_FILE = "client_config.json"
+MAX_MESSAGE_LENGTH = 4000
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -25,6 +26,9 @@ class App:
     def __init__(self):
         self.server = ""
         self.user_id = ""
+        # Token sesji NIE jest zapisywany na dysku (tylko w pamięci procesu) -
+        # celowo, żeby wyciek pliku konfiguracyjnego nie dawał dostępu do konta.
+        self.token = None
         self.config = load_config()
         self.loop = asyncio.new_event_loop()
         self.session = None
@@ -40,9 +44,9 @@ class App:
         self.login_window.title("Komunikator - Logowanie")
         self.login_window.geometry("350x250")
 
-        tk.Label(self.login_window, text="Adres serwera:").pack(pady=(10, 0))
+        tk.Label(self.login_window, text="Adres serwera (https://...):").pack(pady=(10, 0))
         self.server_entry = tk.Entry(self.login_window, width=40)
-        self.server_entry.insert(0, self.config.get("server", "http://127.0.0.1:8000"))
+        self.server_entry.insert(0, self.config.get("server", "https://127.0.0.1:8000"))
         self.server_entry.pack(pady=5)
 
         tk.Label(self.login_window, text="E‑mail:").pack()
@@ -71,13 +75,32 @@ class App:
     # ---------- Sesja HTTP ----------
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
-            # Wymuszamy IPv4, żeby uniknąć opóźnienia przy próbie IPv6 na "localhost".
             connector = aiohttp.TCPConnector(family=socket.AF_INET)
             self.session = aiohttp.ClientSession(connector=connector)
 
+    def _auth_headers(self):
+        return {"Authorization": f"Bearer {self.token}"} if self.token else {}
+
+    async def _handle_unauthorized(self):
+        """Token wygasł/nieprawidłowy - wracamy do ekranu logowania."""
+        self.token = None
+        if hasattr(self, "chat_window"):
+            self.chat_window.after(0, lambda: messagebox.showwarning(
+                "Sesja wygasła", "Zaloguj się ponownie."))
+            self.chat_window.after(0, self._back_to_login)
+
+    def _back_to_login(self):
+        if self.ws:
+            self.run_async(self.ws.close())
+        try:
+            self.chat_window.destroy()
+        except Exception:
+            pass
+        App()
+
     # ---------- Logowanie / rejestracja ----------
     def _normalize_server(self, value):
-        return value.replace("localhost", "127.0.0.1")
+        return value.replace("localhost", "127.0.0.1").rstrip("/")
 
     def login(self):
         self.server = self._normalize_server(self.server_entry.get().strip())
@@ -98,6 +121,7 @@ class App:
                 if resp.status == 200:
                     data = await resp.json()
                     self.user_id = data["user_id"]
+                    self.token = data["token"]
                     self.login_window.after(0, self.open_chat)
                 else:
                     detail = await resp.json()
@@ -114,6 +138,9 @@ class App:
         if not email or not password:
             messagebox.showerror("Błąd", "Podaj e‑mail i hasło")
             return
+        if len(password) < 5:
+            messagebox.showerror("Błąd", "Hasło musi mieć co najmniej 5 znaków")
+            return
         self.run_async(self._register_flow(email, password))
 
     async def _register_flow(self, email, password):
@@ -124,6 +151,7 @@ class App:
                 if resp.status == 200:
                     data = await resp.json()
                     self.user_id = data["user_id"]
+                    self.token = data["token"]
                     self.login_window.after(0, lambda: messagebox.showinfo("Sukces", f"ID: {self.user_id}"))
                     self.login_window.after(0, self.open_chat)
                 else:
@@ -180,7 +208,6 @@ class App:
         self.chat_display.bind("<Button-3>", self.show_message_menu)
         self.chat_display.bind("<Button-2>", self.show_message_menu)
 
-        # zaraz nad input_frame, po chat_display
         refresh_btn_frame = tk.Frame(chat_frame)
         refresh_btn_frame.pack(fill=tk.X, pady=(0, 5))
         tk.Button(refresh_btn_frame, text="Odśwież", command=self.refresh_conversation).pack(side=tk.RIGHT, padx=2)
@@ -211,8 +238,6 @@ class App:
         save_config(self.config)
 
     def clear_alias(self, friend_id):
-        # Przy usunięciu znajomego kasujemy nadaną nazwę - po ponownym dodaniu
-        # ma wrócić do surowego ID, a nie pamiętać starą nazwę.
         if self.config.get("aliases", {}).pop(friend_id, None) is not None:
             save_config(self.config)
 
@@ -222,10 +247,12 @@ class App:
 
     async def _refresh_friends_async(self):
         try:
-            async with self.session.get(f"{self.server}/friends/{self.user_id}") as resp:
+            async with self.session.get(f"{self.server}/friends", headers=self._auth_headers()) as resp:
                 if resp.status == 200:
                     friends = await resp.json()
                     self.chat_window.after(0, self._update_friends_list, friends)
+                elif resp.status == 401:
+                    await self._handle_unauthorized()
         except Exception:
             pass
 
@@ -247,7 +274,10 @@ class App:
     async def _add_friend_async(self, fid):
         try:
             async with self.session.post(f"{self.server}/add_friend",
-                                         json={"my_id": self.user_id, "friend_id": fid}) as resp:
+                                         json={"friend_id": fid}, headers=self._auth_headers()) as resp:
+                if resp.status == 401:
+                    await self._handle_unauthorized()
+                    return
                 data = await resp.json()
                 if resp.status == 200:
                     self.chat_window.after(0, self._add_friend_success, data)
@@ -313,9 +343,11 @@ class App:
     async def _remove_friend_async(self, fid):
         try:
             async with self.session.post(f"{self.server}/remove_friend",
-                                         json={"my_id": self.user_id, "friend_id": fid}) as resp:
+                                         json={"friend_id": fid}, headers=self._auth_headers()) as resp:
                 if resp.status == 200:
                     self.chat_window.after(0, self._friend_removed_locally, fid)
+                elif resp.status == 401:
+                    await self._handle_unauthorized()
                 else:
                     detail = await resp.json()
                     self.chat_window.after(0, lambda: messagebox.showerror("Błąd", detail.get("detail", "")))
@@ -325,9 +357,11 @@ class App:
     async def _block_friend_async(self, fid):
         try:
             async with self.session.post(f"{self.server}/block_user",
-                                         json={"my_id": self.user_id, "target_id": fid}) as resp:
+                                         json={"target_id": fid}, headers=self._auth_headers()) as resp:
                 if resp.status == 200:
                     self.chat_window.after(0, self._friend_removed_locally, fid)
+                elif resp.status == 401:
+                    await self._handle_unauthorized()
                 else:
                     detail = await resp.json()
                     self.chat_window.after(0, lambda: messagebox.showerror("Błąd", detail.get("detail", "")))
@@ -335,7 +369,7 @@ class App:
             self.chat_window.after(0, lambda: messagebox.showerror("Błąd", str(e)))
 
     def _friend_removed_locally(self, fid):
-        self.clear_alias(fid)   # POPRAWKA: reset nazwy - przy ponownym dodaniu wróci do ID
+        self.clear_alias(fid)
         if self.current_friend == fid:
             self.current_friend = None
             self.chat_display.config(state="normal")
@@ -381,10 +415,12 @@ class App:
 
     async def _load_requests_async(self, listbox, request_ids):
         try:
-            async with self.session.get(f"{self.server}/friend_requests/{self.user_id}") as resp:
+            async with self.session.get(f"{self.server}/friend_requests", headers=self._auth_headers()) as resp:
                 if resp.status == 200:
                     requests = await resp.json()
                     self.chat_window.after(0, self._fill_requests_listbox, listbox, request_ids, requests)
+                elif resp.status == 401:
+                    await self._handle_unauthorized()
         except Exception:
             pass
 
@@ -398,10 +434,12 @@ class App:
     async def _accept_request_async(self, fid, on_done):
         try:
             async with self.session.post(f"{self.server}/accept_friend",
-                                         json={"my_id": self.user_id, "friend_id": fid}) as resp:
+                                         json={"friend_id": fid}, headers=self._auth_headers()) as resp:
                 if resp.status == 200:
                     self.chat_window.after(0, on_done)
                     self.chat_window.after(0, self.refresh_friends)
+                elif resp.status == 401:
+                    await self._handle_unauthorized()
                 else:
                     detail = await resp.json()
                     self.chat_window.after(0, lambda: messagebox.showerror("Błąd", detail.get("detail", "")))
@@ -411,9 +449,11 @@ class App:
     async def _decline_request_async(self, fid, on_done):
         try:
             async with self.session.post(f"{self.server}/decline_friend",
-                                         json={"my_id": self.user_id, "friend_id": fid}) as resp:
+                                         json={"friend_id": fid}, headers=self._auth_headers()) as resp:
                 if resp.status == 200:
                     self.chat_window.after(0, on_done)
+                elif resp.status == 401:
+                    await self._handle_unauthorized()
                 else:
                     detail = await resp.json()
                     self.chat_window.after(0, lambda: messagebox.showerror("Błąd", detail.get("detail", "")))
@@ -446,10 +486,12 @@ class App:
 
     async def _load_blocked_async(self, listbox, blocked_ids):
         try:
-            async with self.session.get(f"{self.server}/blocked/{self.user_id}") as resp:
+            async with self.session.get(f"{self.server}/blocked", headers=self._auth_headers()) as resp:
                 if resp.status == 200:
                     blocked = await resp.json()
                     self.chat_window.after(0, self._fill_blocked_listbox, listbox, blocked_ids, blocked)
+                elif resp.status == 401:
+                    await self._handle_unauthorized()
         except Exception:
             pass
 
@@ -463,9 +505,11 @@ class App:
     async def _unblock_async(self, fid, on_done):
         try:
             async with self.session.post(f"{self.server}/unblock_user",
-                                         json={"my_id": self.user_id, "target_id": fid}) as resp:
+                                         json={"target_id": fid}, headers=self._auth_headers()) as resp:
                 if resp.status == 200:
                     self.chat_window.after(0, on_done)
+                elif resp.status == 401:
+                    await self._handle_unauthorized()
                 else:
                     detail = await resp.json()
                     self.chat_window.after(0, lambda: messagebox.showerror("Błąd", detail.get("detail", "")))
@@ -480,10 +524,13 @@ class App:
     async def _load_conversation_async(self):
         try:
             async with self.session.get(
-                f"{self.server}/conversation/{self.user_id}/{self.current_friend}?limit=10000000000000") as resp:
+                f"{self.server}/conversation/{self.current_friend}?limit=200",
+                headers=self._auth_headers()) as resp:
                 if resp.status == 200:
                     msgs = await resp.json()
                     self.chat_window.after(0, self._display_conversation, msgs)
+                elif resp.status == 401:
+                    await self._handle_unauthorized()
         except Exception:
             pass
 
@@ -512,7 +559,6 @@ class App:
         self.displayed_messages.append(msg)
 
     def _msg_exists(self, msg_id):
-        """Sprawdza, czy wiadomość o danym ID już istnieje w displayed_messages."""
         return any(m.get("id") == msg_id for m in self.displayed_messages)
 
     def show_message_menu(self, event):
@@ -522,7 +568,7 @@ class App:
             return
         msg = self.displayed_messages[line]
         if msg.get("deleted"):
-            return  # nic do usunięcia
+            return
         menu = tk.Menu(self.chat_window, tearoff=0)
         menu.add_command(label="Usuń u siebie", command=lambda: self.delete_message(msg, "me"))
         if msg["from"] == self.user_id:
@@ -541,17 +587,16 @@ class App:
     async def _delete_message_async(self, message_id, mode):
         try:
             async with self.session.post(f"{self.server}/delete_message", json={
-                "user_id": self.user_id,
                 "message_id": message_id,
                 "mode": mode
-            }) as resp:
+            }, headers=self._auth_headers()) as resp:
                 if resp.status == 200:
                     if mode == "me":
-                        # Usuwamy lokalnie tylko ten jeden wiersz
                         self.chat_window.after(0, self._remove_message_locally, message_id)
                     else:
-                        # Dla "everyone" wiadomość zmienia treść – przeładuj całość
                         self.chat_window.after(0, self.load_conversation)
+                elif resp.status == 401:
+                    await self._handle_unauthorized()
                 else:
                     detail = await resp.json()
                     self.chat_window.after(0, lambda: messagebox.showerror("Błąd", detail.get("detail", "")))
@@ -559,12 +604,10 @@ class App:
             self.chat_window.after(0, lambda: messagebox.showerror("Błąd", str(e)))
 
     def _remove_message_locally(self, message_id):
-        """Usuwa wiersz z widoku czatu odpowiadający podanemu ID wiadomości."""
         for i, msg in enumerate(self.displayed_messages):
             if msg.get("id") == message_id:
                 del self.displayed_messages[i]
                 self.chat_display.config(state="normal")
-                # Tkinter numeruje linie od 1
                 self.chat_display.delete(float(i + 1), float(i + 2))
                 self.chat_display.config(state="disabled")
                 break
@@ -576,19 +619,24 @@ class App:
         msg = self.msg_entry.get().strip()
         if not msg:
             return
+        if len(msg) > MAX_MESSAGE_LENGTH:
+            messagebox.showwarning("Za długa wiadomość",
+                                    f"Maksymalna długość to {MAX_MESSAGE_LENGTH} znaków")
+            return
         self.msg_entry.delete(0, tk.END)
         self.run_async(self._send_message_async(msg))
 
     async def _send_message_async(self, msg):
         try:
             async with self.session.post(f"{self.server}/send", json={
-                "sender_id": self.user_id,
                 "receiver_id": self.current_friend,
                 "content": msg
-            }) as resp:
+            }, headers=self._auth_headers()) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     self.chat_window.after(0, self._append_message, data["message"])
+                elif resp.status == 401:
+                    await self._handle_unauthorized()
                 else:
                     detail = await resp.json()
                     self.chat_window.after(0, lambda: messagebox.showerror("Błąd", detail.get("detail", "")))
@@ -596,27 +644,41 @@ class App:
             self.chat_window.after(0, lambda: messagebox.showerror("Błąd wysyłania", str(e)))
 
     def refresh_conversation(self):
-        """Wymusza pełne przeładowanie aktualnej konwersacji (jak w starej wersji)."""
         if self.current_friend:
             self.run_async(self._load_conversation_async())
 
     # ---------- WebSocket ----------
+    def _ws_url(self):
+        # Token NIE jest tu dołączany - serwer (i każdy proxy z przodu) mógłby
+        # go zalogować jawnym tekstem razem z URL-em żądania. Wysyłamy go
+        # zamiast tego jako pierwszą wiadomość po nawiązaniu połączenia.
+        if self.server.startswith("https://"):
+            base = "wss://" + self.server[len("https://"):]
+        elif self.server.startswith("http://"):
+            base = "ws://" + self.server[len("http://"):]
+        else:
+            base = "ws://" + self.server
+        return f"{base}/ws"
+
     async def websocket_listener(self):
-        uri = self.server.replace("http", "ws") + f"/ws/{self.user_id}"
+        backoff = 3
         while True:
+            if not self.token:
+                await asyncio.sleep(1)
+                continue
             try:
-                async with connect(uri) as websocket:
+                async with connect(self._ws_url()) as websocket:
+                    await websocket.send(json.dumps({"type": "auth", "token": self.token}))
                     self.ws = websocket
+                    backoff = 3  # reset po udanym połączeniu
                     async for message in websocket:
                         data = json.loads(message)
                         if data["type"] == "new_message":
                             msg = data["data"]
-                            # Pokaż tylko jeśli dotyczy aktywnego rozmówcy
                             if self.current_friend and (
                                 (msg["from"] == self.current_friend and msg["to"] == self.user_id) or
                                 (msg["from"] == self.user_id and msg["to"] == self.current_friend)
                             ):
-                                # Jeżeli wiadomość już wyświetlona (np. dodana przy wysyłaniu) – pomiń
                                 self.chat_window.after(0, self._append_message, msg)
                         elif data["type"] == "friend_added":
                             self.chat_window.after(0, self.refresh_friends)
@@ -633,14 +695,20 @@ class App:
                             if self.current_friend:
                                 self.chat_window.after(0, self.load_conversation)
             except Exception as e:
-                print("WebSocket error, reconnecting in 3s:", e)
-                await asyncio.sleep(3)
+                print(f"WebSocket error, reconnecting in {backoff}s:", e)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)  # backoff wykładniczy, max 60s
 
     def connect_websocket(self):
         self.run_async(self.websocket_listener())
 
     # ---------- Zamknięcie ----------
     async def _close(self):
+        if self.token:
+            try:
+                await self.session.post(f"{self.server}/logout", headers=self._auth_headers())
+            except Exception:
+                pass
         if self.session:
             await self.session.close()
 
