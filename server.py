@@ -1,14 +1,45 @@
 #server.py
+import logging
+from fastapi import Request
+from starlette.middleware.base import BaseHTTPMiddleware
 import secrets
 import hashlib
-import sqlite3
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 import asyncio
 import json
+import sys
+# import pysqlite3
+# sys.modules['sqlite3'] = pysqlite3
+import sqlite3
 
 DB_PATH = "messenger.db"
+
+
+
+# --- KONFIGURACJA LOGOWANIA DLA FAIL2BAN ---
+logger = logging.getLogger("fail2ban_logger")
+logger.setLevel(logging.INFO)
+
+# Logi będą zapisywane do tego pliku tekstowego
+file_handler = logging.FileHandler("fastapi_security.log")
+formatter = logging.Formatter("%(asctime)s - %(levelname)s - IP: %(message)s")
+file_handler.setFormatter(formatter)
+logger.addHandler(file_handler)
+
+# --- MIDDLEWARE WYŁAPUJĄCE BOTY ---
+class Fail2BanMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        # Wyciągamy IP bota (uwzględniając ewentualne proxy jak Nginx/Cloudflare)
+        ip = request.headers.get("x-forwarded-for") or (request.client.host if request.client else "unknown")
+
+        # Skanowanie nieistniejących ścieżek (błąd 404)
+        if response.status_code == 404:
+            logger.warning(f"BOT_SCAN_404 - IP:{ip} tried to access: {request.url.path}")
+        return response
 
 # ---------- Baza danych ----------
 def get_db():
@@ -82,6 +113,7 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
+app.add_middleware(Fail2BanMiddleware)
 
 # ---------- Hasła ----------
 PBKDF2_ITERATIONS = 200_000
